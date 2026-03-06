@@ -22,6 +22,11 @@ enum class JalResolutionResult {
 };
 
 JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_section_index, uint32_t target_func_vram, size_t& matched_function_index) {
+    // Skip resolution if all function calls should use lookup and just return Ambiguous.
+    if (context.use_lookup_for_all_function_calls) {
+        return JalResolutionResult::Ambiguous;
+    }
+
     // Look for symbols with the target vram address
     const N64Recomp::Section& cur_section = context.sections[cur_section_index];
     const auto matching_funcs_find = context.functions_by_vram.find(target_func_vram);
@@ -41,9 +46,7 @@ JalResolutionResult resolve_jal(const N64Recomp::Context& context, size_t cur_se
 
             // Zero-sized symbol handling. unless there's only one matching target.
             if (target_func.words.empty()) {
-                // Allow zero-sized symbols between 0x8F000000 and 0x90000000 for use with patches.
-                // TODO make this configurable or come up with a more sensible solution for dealing with manual symbols for patches.
-                if (target_func.vram < 0x8F000000 || target_func.vram > 0x90000000) {
+                if (!N64Recomp::is_manual_patch_symbol(target_func.vram)) {
                     continue;
                 }
             }
@@ -109,7 +112,7 @@ std::string_view ctx_gpr_prefix(int reg) {
 }
 
 template <typename GeneratorType>
-bool process_instruction(GeneratorType& generator, const N64Recomp::Context& context, const N64Recomp::Function& func, const N64Recomp::FunctionStats& stats, const std::unordered_set<uint32_t>& jtbl_lw_instructions, size_t instr_index, const std::vector<rabbitizer::InstructionCpu>& instructions, std::ostream& output_file, bool indent, bool emit_link_branch, int link_branch_index, size_t reloc_index, bool& needs_link_branch, bool& is_branch_likely, bool tag_reference_relocs, std::span<std::vector<uint32_t>> static_funcs_out) {
+bool process_instruction(GeneratorType& generator, const N64Recomp::Context& context, const N64Recomp::Function& func, size_t func_index, const N64Recomp::FunctionStats& stats, const std::unordered_set<uint32_t>& jtbl_lw_instructions, size_t instr_index, const std::vector<rabbitizer::InstructionCpu>& instructions, std::ostream& output_file, bool indent, bool emit_link_branch, int link_branch_index, size_t reloc_index, bool& needs_link_branch, bool& is_branch_likely, bool tag_reference_relocs, std::span<std::vector<uint32_t>> static_funcs_out) {
     using namespace N64Recomp;
 
     const auto& section = context.sections[func.section_index];
@@ -149,6 +152,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     }
 
     N64Recomp::RelocType reloc_type = N64Recomp::RelocType::R_MIPS_NONE;
+    bool has_reloc = false;
     uint32_t reloc_section = 0;
     uint32_t reloc_target_section_offset = 0;
     size_t reloc_reference_symbol = (size_t)-1;
@@ -159,6 +163,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
     // Check if this instruction has a reloc.
     if (section.relocs.size() > 0 && section.relocs[reloc_index].address == instr_vram) {
+        has_reloc = true;
         // Get the reloc data for this instruction
         const auto& reloc = section.relocs[reloc_index];
         reloc_section = reloc.target_section;
@@ -181,19 +186,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                     reloc_reference_symbol = reloc.symbol_index;
                     // Don't try to relocate special section symbols.
                     if (context.is_regular_reference_section(reloc.target_section) || reloc_section == N64Recomp::SectionAbsolute) {
+                        // TODO this may not be needed anymore as HI16/LO16 relocs to non-relocatable sections is handled directly in elf parsing.
                         bool ref_section_relocatable = context.is_reference_section_relocatable(reloc.target_section);
                         // Resolve HI16 and LO16 reference symbol relocs to non-relocatable sections by patching the instruction immediate.
                         if (!ref_section_relocatable && (reloc_type == N64Recomp::RelocType::R_MIPS_HI16 || reloc_type == N64Recomp::RelocType::R_MIPS_LO16)) {
-                            uint32_t ref_section_vram = context.get_reference_section_vram(reloc.target_section);
-                            uint32_t full_immediate = reloc.target_section_offset + ref_section_vram;
-
-                            if (reloc_type == N64Recomp::RelocType::R_MIPS_HI16) {
-                                imm = (full_immediate >> 16) + ((full_immediate >> 15) & 1);
-                            }
-                            else if (reloc_type == N64Recomp::RelocType::R_MIPS_LO16) {
-                                imm = full_immediate & 0xFFFF;
-                            }
-
                             // The reloc has been processed, so set it to none to prevent it getting processed a second time during instruction code generation.
                             reloc_type = N64Recomp::RelocType::R_MIPS_NONE;
                             reloc_reference_symbol = (size_t)-1;
@@ -219,7 +215,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             if (reloc_index + 1 < section.relocs.size() && next_vram > section.relocs[reloc_index].address) {
                 next_reloc_index++;
             }
-            if (!process_instruction(generator, context, func, stats, jtbl_lw_instructions, instr_index + 1, instructions, output_file, use_indent, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, tag_reference_relocs, static_funcs_out)) {
+            if (!process_instruction(generator, context, func, func_index, stats, jtbl_lw_instructions, instr_index + 1, instructions, output_file, use_indent, false, link_branch_index, next_reloc_index, dummy_needs_link_branch, dummy_is_branch_likely, tag_reference_relocs, static_funcs_out)) {
                 return false;
             }
         }
@@ -238,7 +234,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             return false;
         }
         print_indent();
-        generator.emit_return(context);
+        generator.emit_return(context, func_index);
         print_link_branch();
         return true;
     };
@@ -263,7 +259,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         return true;
     };
 
-    auto print_func_call_by_address = [&generator, reloc_target_section_offset, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch]
+    auto print_func_call_by_address = [&generator, reloc_target_section_offset, has_reloc, reloc_section, reloc_reference_symbol, reloc_type, &context, &func, &static_funcs_out, &needs_link_branch, &print_indent, &process_delay_slot, &print_link_branch]
         (uint32_t target_func_vram, bool tail_call = false, bool indent = false)
     {
         bool call_by_lookup = false;
@@ -300,7 +296,12 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 }
             }
             else {
-                JalResolutionResult jal_result = resolve_jal(context, func.section_index, target_func_vram, matched_func_index);
+                uint32_t target_section = func.section_index;
+                // If this instruction has a reloc and the target section is a normal section, use the section of the reloc when searching for a matching target function. 
+                if (has_reloc && reloc_section < 65500) {
+                    target_section = reloc_section;
+                }
+                JalResolutionResult jal_result = resolve_jal(context, target_section, target_func_vram, matched_func_index);
 
                 switch (jal_result) {
                     case JalResolutionResult::NoMatch:
@@ -316,7 +317,10 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                         call_by_name = true;
                         break;
                     case JalResolutionResult::Ambiguous:
-                        fmt::print(stderr, "[Info] Ambiguous jal target 0x{:08X} in function {}, falling back to function lookup\n", target_func_vram, func.name);
+                        // Print a warning if lookup isn't forced for all non-reloc function calls.
+                        if (!context.use_lookup_for_all_function_calls) {
+                            fmt::print(stderr, "[Info] Ambiguous jal target 0x{:08X} in function {}, falling back to function lookup\n", target_func_vram, func.name);
+                        }
                         // Relocation isn't necessary for jumps inside a relocatable section, as this code path will never run if the target vram
                         // is in the current function's section (see the branch for `in_current_section` above).
                         // If a game ever needs to jump between multiple relocatable sections, relocation will be necessary here.
@@ -363,7 +367,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                     return false;
                 }
                 print_indent();
-                generator.emit_return(context);
+                generator.emit_return(context, func_index);
                 // TODO check if this branch close should exist.
                 // print_indent();
                 // generator.emit_branch_close();
@@ -512,7 +516,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                     return false;
                 }
                 print_indent();
-                generator.emit_return(context);
+                generator.emit_return(context, func_index);
             }
             else {
                 fmt::print(stderr, "Unhandled branch in {} at 0x{:08X} to 0x{:08X}\n", func.name, instr_vram, branch_target);
@@ -552,7 +556,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
             fmt::print("[Info] Indirect tail call in {}\n", func.name);
             print_func_call_by_register(rs);
             print_indent();
-            generator.emit_return(context);
+            generator.emit_return(context, func_index);
             break;
         }
         break;
@@ -561,7 +565,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         generator.emit_syscall(instr_vram);
         // syscalls don't link, so treat it like a tail call
         print_indent();
-        generator.emit_return(context);
+        generator.emit_return(context, func_index);
         break;
     case InstrId::cpu_break:
         print_indent();
@@ -840,7 +844,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
             }
 
             // Process the current instruction and check for errors
-            if (process_instruction(generator, context, func, stats, jtbl_lw_instructions, instr_index, instructions, output_file, false, needs_link_branch, num_link_branches, reloc_index, needs_link_branch, is_branch_likely, tag_reference_relocs, static_funcs_out) == false) {
+            if (process_instruction(generator, context, func, func_index, stats, jtbl_lw_instructions, instr_index, instructions, output_file, false, needs_link_branch, num_link_branches, reloc_index, needs_link_branch, is_branch_likely, tag_reference_relocs, static_funcs_out) == false) {
                 fmt::print(stderr, "Error in recompiling {}, clearing output file\n", func.name);
                 output_file.clear();
                 return false;

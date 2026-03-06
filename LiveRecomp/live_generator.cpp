@@ -238,15 +238,27 @@ constexpr int get_fpr_double_context_offset(int fpr_index) {
     return offsetof(recomp_context, f0.d) + sizeof(recomp_context::f0) * fpr_index;
 }
 
-constexpr int get_fpr_u32l_context_offset(int fpr_index) {
+constexpr bool is_fpr_u32l(N64Recomp::Operand operand) {
+    return
+        operand == N64Recomp::Operand::FdU32L ||
+        operand == N64Recomp::Operand::FsU32L ||
+        operand == N64Recomp::Operand::FtU32L;
+    return false;
+}
+
+constexpr void get_fpr_u32l_context_offset(int fpr_index, sljit_compiler* compiler, int odd_float_address_register, sljit_sw& out, sljit_sw& outw) {
     if (fpr_index & 1) {
-        // TODO implement odd floats.
-        assert(false);
-        return -1;
-        // return fmt::format("ctx->f_odd[({} - 1) * 2]", fpr_index);
+        assert(compiler != nullptr);
+        // Load ctx->f_odd into the address register.
+        sljit_emit_op1(compiler, SLJIT_MOV_P, odd_float_address_register, 0, SLJIT_MEM1(Registers::ctx), offsetof(recomp_context, f_odd));
+        // sljit_emit_op0(compiler, SLJIT_BREAKPOINT);
+        out = SLJIT_MEM1(odd_float_address_register);
+        // Set a memory offset of ((fpr_index - 1) * 2) * sizeof(*f_odd).
+        outw = ((fpr_index - 1) * 2) * sizeof(*recomp_context::f_odd);
     }
     else {
-        return offsetof(recomp_context, f0.u32l) + sizeof(recomp_context::f0) * fpr_index;
+        out = SLJIT_MEM1(Registers::ctx);
+        outw = offsetof(recomp_context, f0.u32l) + sizeof(recomp_context::f0) * fpr_index;
     }
 }
 
@@ -265,7 +277,10 @@ void get_gpr_values(int gpr, sljit_sw& out, sljit_sw& outw) {
     }
 }
 
-bool get_operand_values(N64Recomp::Operand operand, const N64Recomp::InstructionContext& context, sljit_sw& out, sljit_sw& outw) {
+bool get_operand_values(N64Recomp::Operand operand, const N64Recomp::InstructionContext& context, sljit_sw& out, sljit_sw& outw,
+    sljit_compiler* compiler, int odd_float_address_register
+)
+{
     using namespace N64Recomp;
 
     switch (operand) {
@@ -303,16 +318,13 @@ bool get_operand_values(N64Recomp::Operand operand, const N64Recomp::Instruction
             outw = get_fpr_double_context_offset(context.ft);
             break;
         case Operand::FdU32L:
-            out = SLJIT_MEM1(Registers::ctx);
-            outw = get_fpr_u32l_context_offset(context.fd);
+            get_fpr_u32l_context_offset(context.fd, compiler, odd_float_address_register, out, outw);
             break;
         case Operand::FsU32L:
-            out = SLJIT_MEM1(Registers::ctx);
-            outw = get_fpr_u32l_context_offset(context.fs);
+            get_fpr_u32l_context_offset(context.fs, compiler, odd_float_address_register, out, outw);
             break;
         case Operand::FtU32L:
-            out = SLJIT_MEM1(Registers::ctx);
-            outw = get_fpr_u32l_context_offset(context.ft);
+            get_fpr_u32l_context_offset(context.ft, compiler, odd_float_address_register, out, outw);
             break;
         case Operand::FdU32H:
             assert(false);
@@ -389,16 +401,30 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
     if (outputs_to_zero(op.output, ctx)) {
         return;
     }
- 
+    
+    // Float u32l input operands are not allowed in a binary operation.
+    if (is_fpr_u32l(op.operands.operands[0]) || is_fpr_u32l(op.operands.operands[1])) {
+        assert(false);
+        errored = true;
+        return;
+    }
+
+    // A float u32l output operand is only allowed for lwc1, which has an op type of LW.
+    if (is_fpr_u32l(op.output) && op.type != BinaryOpType::LW) {
+        assert(false);
+        errored = true;
+        return;
+    }
+
     sljit_sw dst;
     sljit_sw dstw;
     sljit_sw src1;
     sljit_sw src1w;
     sljit_sw src2;
     sljit_sw src2w;
-    bool output_good = get_operand_values(op.output, ctx, dst, dstw);
-    bool input0_good = get_operand_values(op.operands.operands[0], ctx, src1, src1w);
-    bool input1_good = get_operand_values(op.operands.operands[1], ctx, src2, src2w);
+    bool output_good = get_operand_values(op.output, ctx, dst, dstw, compiler, Registers::arithmetic_temp2);
+    bool input0_good = get_operand_values(op.operands.operands[0], ctx, src1, src1w, nullptr, 0);
+    bool input1_good = get_operand_values(op.operands.operands[1], ctx, src2, src2w, nullptr, 0);
 
     if (!output_good || !input0_good || !input1_good) {
         assert(false);
@@ -748,6 +774,10 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
         case BinaryOpType::LessEqDouble:
             do_float_compare_op(SLJIT_F_LESS_EQUAL, SLJIT_SET_F_LESS_EQUAL, true);
             break;
+        case BinaryOpType::False:
+            // Load 0 into condition destination
+            sljit_emit_op1(compiler, SLJIT_MOV, dst, dstw, SLJIT_IMM, 0);
+            break;
 
         // Loads
         case BinaryOpType::LD:
@@ -797,6 +827,7 @@ void N64Recomp::LiveGenerator::process_binary_op(const BinaryOp& op, const Instr
     }
 }
 
+// TODO these four operations should use banker's rounding, but roundeven is C23 so it's unavailable here.
 int32_t do_round_w_s(float num) {
     return lroundf(num);
 }
@@ -865,12 +896,19 @@ void N64Recomp::LiveGenerator::process_unary_op(const UnaryOp& op, const Instruc
         return;
     }
 
+    // A unary op may have a float u32l as the source or destination, but not both.
+    if (is_fpr_u32l(op.input) && is_fpr_u32l(op.output)) {
+        assert(false);
+        errored = true;
+        return;
+    }
+
     sljit_sw dst;
     sljit_sw dstw;
     sljit_sw src;
     sljit_sw srcw;
-    bool output_good = get_operand_values(op.output, ctx, dst, dstw);
-    bool input_good = get_operand_values(op.input, ctx, src, srcw);
+    bool output_good = get_operand_values(op.output, ctx, dst, dstw, compiler, Registers::arithmetic_temp3);
+    bool input_good = get_operand_values(op.input, ctx, src, srcw, compiler, Registers::arithmetic_temp3);
 
     if (!output_good || !input_good) {
         assert(false);
@@ -1088,11 +1126,23 @@ void N64Recomp::LiveGenerator::process_unary_op(const UnaryOp& op, const Instruc
             emit_l_from_d_func(do_floor_l_d);
             break;
         case UnaryOpType::None:
-            jit_op = SLJIT_MOV;
+            // Only write 32 bits to the output is a fpr u32l operand.
+            if (is_fpr_u32l(op.output)) {
+                jit_op = SLJIT_MOV32;
+            }
+            else {
+                jit_op = SLJIT_MOV;
+            }
             break;
         case UnaryOpType::ToS32:
         case UnaryOpType::ToInt32:
-            jit_op = SLJIT_MOV_S32;
+            // sljit won't emit a sign extension with SLJIT_MOV_32 if the destination is memory,
+            // so emit an explicit move into a register and set that register as the new src.
+            sljit_emit_op1(compiler, SLJIT_MOV_S32, Registers::arithmetic_temp1, 0, src, srcw);
+            // Replace the original input with the temporary register.
+            src = Registers::arithmetic_temp1;
+            srcw = 0;
+            jit_op = SLJIT_MOV;
             break;
         // Unary ops that can't be used as a standalone operation
         case UnaryOpType::ToU32:
@@ -1121,7 +1171,7 @@ void N64Recomp::LiveGenerator::process_store_op(const StoreOp& op, const Instruc
     sljit_sw srcw;
     sljit_sw imm = (sljit_sw)(int16_t)ctx.imm16;
 
-    get_operand_values(op.value_input, ctx, src, srcw);
+    get_operand_values(op.value_input, ctx, src, srcw, compiler, Registers::arithmetic_temp2);
 
     // Only LO16 relocs are valid on stores.
     if (ctx.reloc_type != RelocType::R_MIPS_NONE && ctx.reloc_type != RelocType::R_MIPS_LO16) {
@@ -1259,6 +1309,17 @@ void N64Recomp::LiveGenerator::emit_function_start(const std::string& function_n
     // sljit_emit_op0(compiler, SLJIT_BREAKPOINT);
     sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P, P), 4 | SLJIT_ENTER_FLOAT(1), 5 | SLJIT_ENTER_FLOAT(0), 0);
     sljit_emit_op2(compiler, SLJIT_SUB, Registers::rdram, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+    
+    // Check if this function's entry is hooked and emit the hook call if so.
+    auto find_hook_it = inputs.entry_func_hooks.find(func_index);
+    if (find_hook_it != inputs.entry_func_hooks.end()) {
+        // Load rdram and ctx into R0 and R1.
+        sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
+        // Load the hook's index into R2.
+        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, find_hook_it->second);
+        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3V(P, P, W), SLJIT_IMM, sljit_sw(inputs.run_hook));
+    }
 }
 
 void N64Recomp::LiveGenerator::emit_function_end() const {
@@ -1438,6 +1499,13 @@ void N64Recomp::LiveGenerator::emit_branch_condition(const ConditionalBranchOp& 
         return;
     }
 
+    // Branch conditions do not allow float u32l operands.
+    if (is_fpr_u32l(op.operands.operands[0]) || is_fpr_u32l(op.operands.operands[1])) {
+        assert(false);
+        errored = true;
+        return;
+    }
+
     sljit_s32 condition_type;
     bool cmp_signed = op.operands.operand_operations[0] == UnaryOpType::ToS64;
     // Comparisons need to be inverted to account for the fact that the generator is expected to generate a code block that only runs if
@@ -1491,8 +1559,8 @@ void N64Recomp::LiveGenerator::emit_branch_condition(const ConditionalBranchOp& 
     sljit_sw src2;
     sljit_sw src2w;
 
-    get_operand_values(op.operands.operands[0], ctx, src1, src1w);
-    get_operand_values(op.operands.operands[1], ctx, src2, src2w);
+    get_operand_values(op.operands.operands[0], ctx, src1, src1w, nullptr, 0);
+    get_operand_values(op.operands.operands[1], ctx, src2, src2w, nullptr, 0);
 
     // Relocations aren't valid on conditional branches.
     if(ctx.reloc_type != RelocType::R_MIPS_NONE) {
@@ -1545,8 +1613,14 @@ void N64Recomp::LiveGenerator::emit_switch(const Context& recompiler_context, co
         // Get the relocated address of the jump table.
         uint32_t section_offset = jtbl.vram - jtbl_section.ram_addr;
 
+        // Get the section index to use for relocation at runtime.
+        uint16_t reloc_section_index = jtbl.section_index;
+        if (!inputs.original_section_indices.empty()) {
+            reloc_section_index = inputs.original_section_indices[reloc_section_index];
+        }
+
         // Populate the necessary fields of the dummy context and load the relocated address into temp2.
-        dummy_context.reloc_section_index = jtbl.section_index;
+        dummy_context.reloc_section_index = reloc_section_index;
         dummy_context.reloc_target_section_offset = section_offset;
         load_relocated_address(dummy_context, Registers::arithmetic_temp2);
 
@@ -1590,7 +1664,19 @@ void N64Recomp::LiveGenerator::emit_switch_close() const {
     // Nothing to do here, the jump table is built in emit_switch.
 }
 
-void N64Recomp::LiveGenerator::emit_return(const Context& context) const {
+void N64Recomp::LiveGenerator::emit_return(const Context& context, size_t func_index) const {
+    (void)context;
+    
+    // Check if this function's return is hooked and emit the hook call if so.
+    auto find_hook_it = inputs.return_func_hooks.find(func_index);
+    if (find_hook_it != inputs.return_func_hooks.end()) {
+        // Load rdram and ctx into R0 and R1.
+        sljit_emit_op2(compiler, SLJIT_ADD, SLJIT_R0, 0, Registers::rdram, 0, SLJIT_IMM, rdram_offset);
+        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R1, 0, Registers::ctx, 0);
+        // Load the return hook's index into R2.
+        sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, find_hook_it->second);
+        sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS3V(P, P, W), SLJIT_IMM, sljit_sw(inputs.run_hook));
+    }
     sljit_emit_return_void(compiler);
 }
 
@@ -1642,8 +1728,11 @@ void N64Recomp::LiveGenerator::emit_cop1_cs_read(int reg) const {
         // Call get_cop1_cs.
         sljit_emit_icall(compiler, SLJIT_CALL, SLJIT_ARGS0(32), SLJIT_IMM, sljit_sw(get_cop1_cs));
 
-        // Store the result in the output register.
-        sljit_emit_op1(compiler, SLJIT_MOV_S32, dst, dstw, SLJIT_RETURN_REG, 0);
+        // Sign extend the result into a temp register.
+        sljit_emit_op1(compiler, SLJIT_MOV_S32, Registers::arithmetic_temp1, 0, SLJIT_RETURN_REG, 0);
+
+        // Move the sign extended result into the destination.
+        sljit_emit_op1(compiler, SLJIT_MOV, dst, dstw, Registers::arithmetic_temp1, 0);
     }
 }
 
@@ -1863,3 +1952,29 @@ bool N64Recomp::recompile_function_live(LiveGenerator& generator, const Context&
     return recompile_function_custom(generator, context, function_index, output_file, static_funcs_out, tag_reference_relocs);
 }
 
+N64Recomp::ShimFunction::ShimFunction(recomp_func_ext_t* to_shim, uintptr_t value) {
+    sljit_compiler* compiler = sljit_create_compiler(nullptr);
+
+    // Create the function.
+    sljit_label* func_label = sljit_emit_label(compiler);
+    sljit_emit_enter(compiler, 0, SLJIT_ARGS2V(P_R, P_R), 3, 0, 0);
+
+    // Move the provided value into the third argument.
+    sljit_emit_op1(compiler, SLJIT_MOV, SLJIT_R2, 0, SLJIT_IMM, sljit_sw(value));
+
+    // Tail call the provided function.
+    sljit_emit_icall(compiler, SLJIT_CALL | SLJIT_CALL_RETURN, SLJIT_ARGS3V(P, P, W), SLJIT_IMM, sljit_sw(to_shim));
+
+    // Generate the function's code and get the address to the function.
+    code = sljit_generate_code(compiler, 0, nullptr);
+    func = reinterpret_cast<recomp_func_t*>(sljit_get_label_addr(func_label));
+
+    // Cleanup.
+    sljit_free_compiler(compiler);
+}
+
+N64Recomp::ShimFunction::~ShimFunction() {
+    sljit_free_code(code, nullptr);
+    code = nullptr;
+    func = nullptr;
+}

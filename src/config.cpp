@@ -201,8 +201,8 @@ std::vector<N64Recomp::InstructionPatch> get_instruction_patches(const toml::tab
     return ret;
 }
 
-std::vector<N64Recomp::FunctionHook> get_function_hooks(const toml::table* patches_data) {
-    std::vector<N64Recomp::FunctionHook> ret;
+std::vector<N64Recomp::FunctionTextHook> get_function_hooks(const toml::table* patches_data) {
+    std::vector<N64Recomp::FunctionTextHook> ret;
 
     // Check if the function hook array exists.
     const toml::node_view func_hook_data = (*patches_data)["hook"];
@@ -230,7 +230,7 @@ std::vector<N64Recomp::FunctionHook> get_function_hooks(const toml::table* patch
                     throw toml::parse_error("before_vram is not word-aligned", el.source());
                 }
 
-                ret.push_back(N64Recomp::FunctionHook{
+                ret.push_back(N64Recomp::FunctionTextHook{
                     .func_name = func_name.value(),
                     .before_vram = before_vram.has_value() ? (int32_t)before_vram.value() : 0,
                     .text = text.value(),
@@ -243,6 +243,46 @@ std::vector<N64Recomp::FunctionHook> get_function_hooks(const toml::table* patch
     }
 
     return ret;
+}
+
+void get_mdebug_mappings(const toml::array* mdebug_mappings_array,
+    std::unordered_map<std::string, std::string>& mdebug_text_map,
+    std::unordered_map<std::string, std::string>& mdebug_data_map,
+    std::unordered_map<std::string, std::string>& mdebug_rodata_map,
+    std::unordered_map<std::string, std::string>& mdebug_bss_map
+) {
+    mdebug_mappings_array->for_each([&mdebug_text_map, &mdebug_data_map, &mdebug_rodata_map, &mdebug_bss_map](auto&& el) {
+        if constexpr (toml::is_table<decltype(el)>) {
+            std::optional<std::string> filename = el["filename"].template value<std::string>();
+            std::optional<std::string> input_section = el["input_section"].template value<std::string>();
+            std::optional<std::string> output_section = el["output_section"].template value<std::string>();
+
+            if (filename.has_value() && input_section.has_value() && output_section.has_value()) {
+                const std::string& input_section_val = input_section.value();
+                if (input_section_val == ".text") {
+                    mdebug_text_map.emplace(filename.value(), output_section.value());
+                }
+                else if (input_section_val == ".data") {
+                    mdebug_data_map.emplace(filename.value(), output_section.value());
+                }
+                else if (input_section_val == ".rodata") {
+                    mdebug_rodata_map.emplace(filename.value(), output_section.value());
+                }
+                else if (input_section_val == ".bss") {
+                    mdebug_bss_map.emplace(filename.value(), output_section.value());
+                }
+                else {
+                    throw toml::parse_error("Invalid input section in mdebug file mapping entry", el.source());
+                }
+            }
+            else {
+                throw toml::parse_error("Mdebug file mappings entry is missing required value(s)", el.source());
+            }
+        }
+        else {
+            throw toml::parse_error("Invalid mdebug file mappings entry", el.source());
+        }
+    });
 }
 
 N64Recomp::Config::Config(const char* path) {
@@ -366,6 +406,22 @@ N64Recomp::Config::Config(const char* path) {
         }
         else {
             unpaired_lo16_warnings = true;
+        }
+
+        // Control whether the recompiler should look for and parse mdebug (optional, defaults to false)
+        std::optional<bool> use_mdebug_opt = input_data["use_mdebug"].value<bool>();
+        if (use_mdebug_opt.has_value()) {
+            use_mdebug = use_mdebug_opt.value();
+        }
+        else {
+            use_mdebug = false;
+        }
+
+        // Symbols to ignore when parsing mdebug (option, defaults to empty)
+        toml::node_view mdebug_mappings_data = input_data["mdebug_file_mappings"];
+        if (mdebug_mappings_data.is_array()) {
+            get_mdebug_mappings(mdebug_mappings_data.as_array(),
+                mdebug_text_map, mdebug_data_map, mdebug_rodata_map, mdebug_bss_map);
         }
 
         std::optional<std::string> recomp_include_opt = input_data["recomp_include"].value<std::string>();
@@ -609,7 +665,7 @@ bool N64Recomp::Context::from_symbol_file(const std::filesystem::path& symbol_fi
 
                                 RelocType reloc_type = reloc_type_from_name(type_string.value());
 
-                                if (reloc_type != RelocType::R_MIPS_HI16 && reloc_type != RelocType::R_MIPS_LO16 && reloc_type != RelocType::R_MIPS_32) {
+                                if (reloc_type != RelocType::R_MIPS_HI16 && reloc_type != RelocType::R_MIPS_LO16 && reloc_type != RelocType::R_MIPS_26 && reloc_type != RelocType::R_MIPS_32) {
                                     throw toml::parse_error("Invalid reloc entry type", reloc_el.source());
                                 }
 
