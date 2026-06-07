@@ -469,7 +469,7 @@ void recomp_syscall_handler(uint8_t* rdram, recomp_context* ctx, int32_t instruc
 void pause_self(uint8_t *rdram);
 
 void recomp_enter_function(const char* name, gpr address);
-void recomp_exit_function();
+void recomp_exit_function(void);
 
 #ifdef __cplusplus
 }
