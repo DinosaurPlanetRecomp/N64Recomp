@@ -1948,6 +1948,14 @@ void N64Recomp::LiveGenerator::emit_comment(const std::string& comment) const {
     // Nothing to do here.
 }
 
+void N64Recomp::LiveGenerator::emit_function_entry(const std::string& function_name, uint32_t address) const {
+    
+}
+
+void N64Recomp::LiveGenerator::emit_function_exit(const std::string& function_name, uint32_t address) const {
+    
+}
+
 bool N64Recomp::recompile_function_live(LiveGenerator& generator, const Context& context, size_t function_index, std::ostream& output_file, std::span<std::vector<uint32_t>> static_funcs_out, bool tag_reference_relocs) {
     return recompile_function_custom(generator, context, function_index, output_file, static_funcs_out, tag_reference_relocs);
 }

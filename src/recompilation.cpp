@@ -239,6 +239,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
         if (!process_delay_slot(false)) {
             return false;
         }
+        generator.emit_function_exit(func.name, func.vram);
         print_indent();
         generator.emit_return(context, func_index);
         print_link_branch();
@@ -372,6 +373,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 if (!print_func_call_by_address(branch_target, true, true)) {
                     return false;
                 }
+                generator.emit_function_exit(func.name, func.vram);
                 print_indent();
                 generator.emit_return(context, func_index);
                 // TODO check if this branch close should exist.
@@ -521,6 +523,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
                 if (!print_func_call_by_address(branch_target, true)) {
                     return false;
                 }
+                generator.emit_function_exit(func.name, func.vram);
                 print_indent();
                 generator.emit_return(context, func_index);
             }
@@ -561,6 +564,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
 
             fmt::print("[Info] Indirect tail call in {}\n", func.name);
             print_func_call_by_register(rs);
+            generator.emit_function_exit(func.name, func.vram);
             print_indent();
             generator.emit_return(context, func_index);
             break;
@@ -569,6 +573,7 @@ bool process_instruction(GeneratorType& generator, const N64Recomp::Context& con
     case InstrId::cpu_syscall:
         print_indent();
         generator.emit_syscall(instr_vram);
+        generator.emit_function_exit(func.name, func.vram);
         // syscalls don't link, so treat it like a tail call
         print_indent();
         generator.emit_return(context, func_index);
@@ -772,6 +777,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
     std::vector<rabbitizer::InstructionCpu> instructions;
 
     generator.emit_function_start(func.name, func_index);
+    generator.emit_function_entry(func.name, func.vram);
 
     if (context.trace_mode) {
         fmt::print(output_file,
@@ -879,6 +885,7 @@ bool recompile_function_impl(GeneratorType& generator, const N64Recomp::Context&
     }
 
     // Terminate the function
+    generator.emit_function_exit(func.name, func.vram);
     generator.emit_function_end();
     
     return true;
