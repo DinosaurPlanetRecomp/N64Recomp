@@ -663,6 +663,6 @@ void N64Recomp::CGenerator::emit_function_entry(const std::string& function_name
     fmt::print(output_file, "    recomp_enter_function(\"{}\", 0x{:08X});\n", function_name, address);
 }
 
-void N64Recomp::CGenerator::emit_function_exit(const std::string& function_name, uint32_t address) const {
-    fmt::print(output_file, "    recomp_exit_function(\"{}\", 0x{:08X});\n", function_name, address);
+void N64Recomp::CGenerator::emit_function_exit() const {
+    fmt::print(output_file, "    recomp_exit_function();\n");
 }
